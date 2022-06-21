@@ -1,16 +1,21 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/stat.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <syslog.h>
 #include <pthread.h>
 #include <poll.h>
 #include <stdarg.h>
-#include <stdlib.h>
 #include <unistd.h> // sysconf
-#include <math.h>
 #include <fcntl.h>
 #include <string.h>
 #include <errno.h>
+// BEGIN SIGTERM handling
+#include <signal.h> 
+#include <sys/signalfd.h>
+// END SIGTERM handling
 
 #ifdef WIN32
 #include <windows.h>
@@ -22,19 +27,16 @@
 #define TCP_END_PRIVATE_PORT (0b01 << 16) - 1
 #define TCP_MAX_PRIVATE_PORTS (TCP_BEGIN_PRIVATE_PORT - TCP_END_PRIVATE_PORT)
 
-#define logn(str, ...) sync_printf(str "\n", ## __VA_ARGS__);\
+#define logn(str, ...) sync_printf(str "\n", ## __VA_ARGS__);
+#define logerr(str, ...) sync_printf(str "\n", ## __VA_ARGS__);
+#if 0
+#define logerr_(str, file, line, func,  ...) sync_printf("[" #file "," #line "," #func "] Error: " str , ## __VA_ARGS__);
+#define logerr(str, ...) logerr_(str , __FILE__ , __LINE__ , __func__ , ## __VA_ARGS__);
+#endif
 
 #define Assert(cond) if (!(cond)) { *(int *)0 = 0; };
-#define ArrayCount(a) (sizeof(a) / sizeof(a[0]))
+#define ArrayCount(a) (int)(sizeof(a) / sizeof(a[0]))
 
-#define SOCKET_CHECK(func) {\
-                              int result = func;\
-                              if (result < 0)\
-                              {\
-                                logn("Error (%i) on " #func, errno);\
-                                close(socketfd);\
-                              }\
-                            }
 /*
  * TERMINOLOGY
  * 	- fd: file descriptor. socketfd == socket file descriptor
@@ -64,6 +66,7 @@ sleep_ms(int milliseconds)
 }
 
 static pthread_mutex_t printf_mutex;
+static FILE * log_file;
 
 void
 sync_printf(const char *format, ...)
@@ -72,7 +75,12 @@ sync_printf(const char *format, ...)
   va_start(args, format);
 
   pthread_mutex_lock(&printf_mutex);
+#if DEBUG
   vprintf(format, args);
+#else
+  vfprintf(log_file,format,args);
+  fflush(log_file);
+#endif
   pthread_mutex_unlock(&printf_mutex);
 
   va_end(args);
@@ -176,18 +184,23 @@ struct socket_connection
 
 struct server
 {
+  __attribute__((aligned (8)))
 #define MAX_OPEN_CONNECTIONS 12
-  int socketfd;
+  int socket_fd;
+  int signal_fd;
   struct socket_connection connections[MAX_OPEN_CONNECTIONS];
   pthread_mutex_t nfds_mutex;
   int nfds;
+  int fds_begin_client_index;
   struct pollfd fds[MAX_OPEN_CONNECTIONS];
+  int max_open_connections;
 
   pthread_cond_t condition_connection_released;
   pthread_mutex_t mutex_connection;
 
-  struct thread_queue queue;
+  struct thread_queue * queue;
 
+  int default_timeout;
   int keep_alive;
 };
 
@@ -273,60 +286,6 @@ ASYNC_FUNC_HANDLER(AsyncHandleClient)
   }
 }
 
-void
-IncomingConnectionsHandler(struct server * server)
-{
-  if (server->nfds < ArrayCount(server->connections))
-  {
-    int timeout = 30 * 1000 * 6;
-    struct pollfd pollfd[1];
-    pollfd[0].fd = server->socketfd;
-    pollfd[0].events = POLLIN;
-
-    // blocking
-    logn("[Thread %lu] Waiting on incoming connections", pthread_self());
-    int number_of_events = poll(pollfd, 1, timeout);
-    if (number_of_events < 0)
-    {
-      logn("Poll() returns error %i",number_of_events);
-      Assert(0);
-    }
-    else if (number_of_events == 0)
-    {
-      logn("Poll() timeout");
-      Assert(0);
-    }
-    else
-    {
-      for (;;)
-      {
-        struct sockaddr_in addr;
-        socklen_t addr_size = sizeof(struct sockaddr);
-        int new_fd = accept(server->socketfd, (struct sockaddr *)&addr, &addr_size);
-        if (new_fd < 0)
-        {
-          if (errno != EWOULDBLOCK)
-          {
-            logn("Error (%i) on accept() [Thread %lu]",errno,pthread_self());
-            Assert(0);
-          }
-          break;
-        }
-        pthread_mutex_lock(&server->nfds_mutex);
-        struct socket_connection * new_connection = server->connections + server->nfds;
-        new_connection->ext_addr_size = sizeof(struct sockaddr_in);
-        new_connection->fd = new_fd;
-        server->fds[server->nfds].events = POLLIN;
-        server->fds[server->nfds].revents = 0;
-        server->fds[server->nfds].fd = new_fd;
-        server->nfds += 1;
-        pthread_mutex_unlock(&server->nfds_mutex);
-        logn("New connection received %i", new_connection->ext_addr.sin_addr.s_addr);
-      }
-    }
-  }
-}
-
 #if 0
 ASYNC_FUNC_HANDLER(AsyncIncomingConnectionsHandler)
 {
@@ -402,6 +361,7 @@ memset(void *dest, register int val, register size_t len)
 }
 #endif
 
+#if 0
 void
 TestThread(struct thread_queue * Queue)
 {
@@ -417,6 +377,7 @@ TestThread(struct thread_queue * Queue)
   }
   WaitUntilAllTasksCompleted(Queue);
 }
+#endif
 
 int
 max_val(int a, int b)
@@ -425,18 +386,155 @@ max_val(int a, int b)
   return result;
 }
 
+#define TCP_SERVER_NONBLOCKING 1
+int
+CreateServer(struct server * server, int port, int tcp_server_type, int signal_fd, struct thread_queue * ThreadQueue)
+{
+
+  memset(server,0,sizeof(struct server));
+
+  server->socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (server->socket_fd > 0)
+  {
+    struct sockaddr_in my_addr = {0};
+    memset(&my_addr, 0 , sizeof(my_addr));
+    my_addr.sin_family = AF_INET;
+    my_addr.sin_port = htons(port);
+    my_addr.sin_addr.s_addr = INADDR_ANY;
+
+    // re-use socket
+    int optval = 0;
+    if (setsockopt(server->socket_fd,SOL_SOCKET,SO_REUSEADDR,(char *)&optval, sizeof(optval)) == 0)
+    {
+      if (tcp_server_type & TCP_SERVER_NONBLOCKING)
+      {
+        int socketfd_flags = fcntl(server->socket_fd, F_GETFL);
+        fcntl(server->socket_fd, F_SETFL, socketfd_flags | O_NONBLOCK);
+      }
+
+      if (bind(server->socket_fd, (struct sockaddr *)&my_addr, sizeof(struct sockaddr)) == 0)
+      {
+        if(listen(server->socket_fd, MAX_OPEN_CONNECTIONS) == 0)
+        {
+          server->keep_alive = 1;
+          server->default_timeout = 30 * 1000 * 6;
+
+          // reserved fd
+          int fd_reserved[] = {
+            server->socket_fd,  // accept connections
+            signal_fd           // SIGTERM signals
+          };
+
+          for (int i = 0; i < ArrayCount(fd_reserved);++i)
+          {
+            struct pollfd * pollfd = server->fds + server->nfds++;
+            pollfd->fd = fd_reserved[i];
+            pollfd->events = POLLIN;
+          }
+
+          if (ThreadQueue != NULL)
+          {
+            server->queue = ThreadQueue;
+          }
+          server->fds_begin_client_index = server->nfds;
+        }
+        else
+        {
+          logerr("listen()");
+        }
+      }
+      else
+      {
+        logerr("bind()");
+      }
+    }
+    else
+    {
+      logerr("setsockopt()");
+    }
+  }
+  else
+  {
+    logerr("socket()");
+  }
+
+  int server_creation_error = (server->keep_alive == 0);
+
+  return server_creation_error;
+}
+
+int
+Daemonize(const char * log_file_name)
+{
+  int result = 0;
+
+  // daemon fork its own process
+  pid_t pid, sid;
+  pid = fork();
+
+  if (pid < 0)
+  {
+    printf("Error on fork()\n");
+    exit(EXIT_FAILURE);
+  }
+
+  if (pid > 0) 
+  {
+    printf("Success fork with pid %i\n",pid);
+    exit(EXIT_SUCCESS);
+  }
+
+  // full access to files generated by daemon
+  umask(0);
+
+  // logs
+  pthread_mutex_init(&printf_mutex,NULL);
+
+  log_file = fopen(log_file_name, "wt+");
+
+  sid = setsid();
+  if (sid < 0 )
+  {
+    logn("Error on setid()");
+    exit(EXIT_FAILURE);
+  }
+
+  if (chdir("/") < 0)
+  {
+    logn("Error on chdir(""/"")");
+    exit (EXIT_FAILURE);
+  }
+
+  // disable std
+#if DISABLE_STDIO
+  close(STDIN_FILENO);
+  close(STDOUT_FILENO);
+  close(STDERR_FILENO);
+#endif
+
+  return result;
+}
+
+
+
 int
 main()
 {
+
+  const char * log_file_name = "./linux_tcp_server.log";
+#if DAEMON
+  printf("Log file is %s", log_file_name);
+  Daemonize(log_file_name);
+#else
+  // logs
+  log_file = fopen(log_file_name, "wt+");
   pthread_mutex_init(&printf_mutex,NULL);
+#endif
 
-  int keep_alive = 1;
+  logerr("test()");
 
-  int default_port = TCP_BEGIN_PRIVATE_PORT;
-  int socketfd = 0;
-  int on = 0;
-
-  const int max_threads = 40; // capped by number_of_processors
+  /* THREAD POOL */
+  const int max_threads = 40;
   pthread_t list_threads[max_threads];
   pthread_cond_t  condition_cond  = PTHREAD_COND_INITIALIZER;
   pthread_mutex_t condition_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -450,195 +548,202 @@ main()
 
   int count_threads = max_val(4,(int)sysconf(_SC_NPROCESSORS_ONLN));
 
-  // reserve 1 thread to handle new connections
   for (int i = 0; i < count_threads; ++i)
   {
     pthread_t * thread = list_threads + i;
     int thread_id =	pthread_create(thread, NULL,ThreadHandler, &primary_thread_queue);
+    Assert(thread_id == 0);
   }
 
-#if 0
-  socketfd = socket(AF_INET6, SOCK_STREAM, 0);
-  if (socketfd == -1)
+  /* SIGTERM handlers */
+  sigset_t sigset;
+  struct signalfd_siginfo siginfo;
+  int signal_fd;
+
+  if (sigemptyset(&sigset) != 0)
   {
-    logn("Error on socket()");
+    logerr("sigemptyset()");
     return 0;
   }
-  struct sockaddr_in6 my_addr = {0};
-  memset(&my_addr, 0 , sizeof(my_addr));
-  my_addr.sin6_family = AF_INET6;
-  my_addr.sin6_port = htons(default_port);
-  //my_addr.sin_addr.s_addr = INADDR_ANY;
-  memcpy(&my_addr.sin6_addr, &in6addr_any, sizeof(in6addr_any));
-#else
-  socketfd = socket(AF_INET, SOCK_STREAM, 0);
-  if (socketfd == -1)
+  if (sigaddset(&sigset, SIGTERM) != 0)
   {
-    logn("Error on socket()");
+    logerr("sigaddset()");
     return 0;
   }
-  struct sockaddr_in my_addr = {0};
-  memset(&my_addr, 0 , sizeof(my_addr));
-  my_addr.sin_family = AF_INET;
-  logn("Port %i",default_port);
-  my_addr.sin_port = htons(default_port);
-  my_addr.sin_addr.s_addr = INADDR_ANY;
-#endif
+  if (sigprocmask(SIG_SETMASK,&sigset, NULL) != 0)
+  {
+    logerr("sigprocmask()");
+    return 0;
+  }
 
-  // re-use socket
-  SOCKET_CHECK(setsockopt(socketfd,SOL_SOCKET,SO_REUSEADDR,(char *)&on, sizeof(on)));
-
-
-  // non blocking
-#if 1
-  int socketfd_flags = fcntl(socketfd, F_GETFL);
-  fcntl(socketfd, F_SETFL, socketfd_flags | O_NONBLOCK);
-#endif
-
-  SOCKET_CHECK(bind(socketfd, (struct sockaddr *)&my_addr, sizeof(struct sockaddr)));
-  SOCKET_CHECK(listen(socketfd, MAX_OPEN_CONNECTIONS));
+  signal_fd = signalfd(-1, &sigset, SFD_NONBLOCK);
 
   struct server server;
-  server.keep_alive = 1;
-  server.nfds = 0;
-  server.socketfd = socketfd;
-  memset(server.connections, 0,sizeof(server.connections));
-  memset(server.fds, 0 , sizeof(server.fds));
-
-#if 0
-  //AddTask(&primary_thread_queue, AsyncIncomingConnectionsHandler, (void *)&server);
-  //AddTask(&primary_thread_queue, AsyncHandleClient, (void *)&server);
-  while (server.keep_alive)
+  if (CreateServer(&server,
+                   TCP_BEGIN_PRIVATE_PORT, 
+                   TCP_SERVER_NONBLOCKING, 
+                   signal_fd,
+                   &primary_thread_queue) != 0)
   {
-    IncomingConnectionsHandler(&server);
+    logn("Failed to create server. Terminating.");
+    return 0;
   }
-#else
-  server.nfds += 1;
-  server.fds[0].fd = socketfd;
-  server.fds[0].events = POLLIN;
-  int timeout = 30 * 1000 * 6;
+
   char buffer[80];
   while (server.keep_alive)
   {
-    int number_of_events = poll(server.fds, server.nfds,timeout);
+    int number_of_events = poll(server.fds, server.nfds,server.default_timeout);
     logn("Poll() returns with %i events", number_of_events);
 
     if (number_of_events < 0)
     {
       logn("Poll() returns error %i",number_of_events);
-      Assert(0);
+      server.keep_alive = 0;
     }
     else if (number_of_events == 0)
     {
       logn("Poll() timeout");
-      Assert(0);
+      server.keep_alive = 0;
     }
     else
     {
       int handled_responses = 0;
-      for (int i = 0;
+
+      struct pollfd * server_pollfd = server.fds + 0;
+      // new connections
+      if (server_pollfd->revents & POLLIN)
+      {
+        int new_fd = -1;
+        do
+        {
+          struct sockaddr_in addr;
+          socklen_t addr_size = sizeof(struct sockaddr);
+          logn("Invoking accept()");
+          new_fd = accept(server_pollfd->fd, (struct sockaddr *)&addr, &addr_size);
+          logn("Accept() returns %i", new_fd);
+          if (new_fd < 0)
+          {
+            if (errno != EWOULDBLOCK)
+            {
+              logn("Error (%i) on accept() [Thread %lu]",errno,pthread_self());
+              Assert(0);
+            }
+            break;
+          }
+          //pthread_mutex_lock(&server.nfds_mutex);
+          struct socket_connection * new_connection = server.connections + server.nfds;
+          new_connection->ext_addr_size = sizeof(struct sockaddr_in);
+          new_connection->fd = new_fd;
+          server.fds[server.nfds].events = POLLIN;
+          server.fds[server.nfds].revents = 0;
+          server.fds[server.nfds].fd = new_fd;
+          server.nfds += 1;
+
+          if (server.nfds >= MAX_OPEN_CONNECTIONS)
+          {
+            // http://man7.org/linux/man-pages/man2/poll.2.html#DESCRIPTION
+            // if fd is < 0 is ignored
+            server.fds[0].fd = -server.fds[0].fd;
+          }
+
+          //pthread_mutex_unlock(&server.nfds_mutex);
+          logn("New connection received %i", new_connection->ext_addr.sin_addr.s_addr);
+        } while (new_fd != -1);
+      }
+
+      // SIGTERM
+      if (server.fds[1].revents & POLLIN)
+      {
+        logn("SIGTERM received");
+        if (read(server.fds[1].fd, &siginfo, sizeof(siginfo)) != sizeof(siginfo))
+        {
+          logerr("read() signal_fd file returns data bigger than siginfo size");
+        }
+        server.keep_alive = 0;
+      }
+
+      // Client connections
+      for (int i = server.fds_begin_client_index;
            i < server.nfds;
            ++i)
       {
-        if (server.fds[i].revents == 0)
+        struct pollfd * test_pollfd = server.fds + i;
+        if (test_pollfd->revents == 0)
         {
           continue;
         }
-        else if (server.fds[i].revents == POLLIN)
+        else if (test_pollfd->revents == POLLIN)
         {
-            // new connections
-            if (server.fds[i].fd == socketfd)
+          int connection_is_alive = 1;
+          do
+          {
+            int result = recv(test_pollfd->fd, buffer, sizeof(buffer), 0);
+
+            if (result < 0)
             {
-              int new_fd = -1;
-              do
+              if (errno != EWOULDBLOCK)
               {
-                struct sockaddr_in addr;
-                socklen_t addr_size = sizeof(struct sockaddr);
-                logn("Invoking accept()");
-                new_fd = accept(server.fds[i].fd, (struct sockaddr *)&addr, &addr_size);
-                logn("Accept() returns %i", new_fd);
-                if (new_fd < 0)
-                {
-                  if (errno != EWOULDBLOCK)
-                  {
-                    logn("Error (%i) on accept() [Thread %lu]",errno,pthread_self());
-                    Assert(0);
-                  }
-                  break;
-                }
-                //pthread_mutex_lock(&server.nfds_mutex);
-                struct socket_connection * new_connection = server.connections + server.nfds;
-                new_connection->ext_addr_size = sizeof(struct sockaddr_in);
-                new_connection->fd = new_fd;
-                server.fds[server.nfds].events = POLLIN;
-                server.fds[server.nfds].revents = 0;
-                server.fds[server.nfds].fd = new_fd;
-                server.nfds += 1;
-                //pthread_mutex_unlock(&server.nfds_mutex);
-                logn("New connection received %i", new_connection->ext_addr.sin_addr.s_addr);
-              } while (new_fd != -1);
+                logerr("recv()");
+                connection_is_alive = 0;
+                break;
+              }
+              // nothing to read
+              logn("Nothing to recv() break");
+              break;
             }
-            // rec msg
-            else
+
+            if (result == 0 || (connection_is_alive == 0))
             {
-              int connection_is_alive = 1;
-              do
+              connection_is_alive = 0;
+              //pthread_mutex_lock(&server.nfds_mutex);
+              if (i != server.nfds)
               {
-                int result = recv(server.fds[i].fd, buffer, sizeof(buffer), 0);
-                if (result < 0)
-                {
-                  if (errno != EWOULDBLOCK)
-                  {
-                    logn("recv() error");
-                    Assert(0);
-                  }
-                  // nothing to read
-                  logn("Nothing to recv() break");
-                  break;
-                }
-                // conn closed
-                else if (result == 0)
-                {
-                  connection_is_alive = 0;
-                  //pthread_mutex_lock(&server.nfds_mutex);
-                  if (i != server.nfds)
-                  {
-                    close(server.fds[i].fd);
-                    // swap last
-                    memcpy(server.fds + i,server.fds + (server.nfds - 1), sizeof(struct pollfd));
-                    memcpy(server.connections + i, server.connections + (server.nfds - 1), sizeof(struct socket_connection));
-                    i -= 1; // dont adv pointer
-                  }
-                  server.nfds -= 1;
-                  if (server.nfds == 1)
-                  {
-                    // close server if no more connections
-                    logn("Connections dropped to 0. Shutting down server");
-                    server.keep_alive = 0;
-                  }
-                  //pthread_mutex_unlock(&server.nfds_mutex);
-                }
-                logn("%s",buffer);
-              } while (connection_is_alive);
+                close(test_pollfd->fd);
+                // swap last
+                struct pollfd * last_pollfd = server.fds + (server.nfds - 1);
+                memcpy(test_pollfd, last_pollfd, sizeof(struct pollfd));
+                memcpy(server.connections + i, server.connections + (server.nfds - 1), sizeof(struct socket_connection));
+                i -= 1; // dont adv pointer
+              }
+
+              // check if max capacity was reached and accept new connections
+              if (server.nfds >= MAX_OPEN_CONNECTIONS)
+              {
+                // http://man7.org/linux/man-pages/man2/poll.2.html#DESCRIPTION
+                // if fd is < 0 is ignored
+                Assert(server_pollfd->fd < 0);
+                server_pollfd->fd = -server_pollfd->fd;
+              }
+
+              // only now decrement
+              server.nfds -= 1;
+              if (server.nfds == server.fds_begin_client_index)
+              {
+                // close server if no more connections
+                logn("All connections closed");
+              }
+
+              //pthread_mutex_unlock(&server.nfds_mutex);
             }
+            logn("Client sends message: %s",buffer);
+          } while (connection_is_alive);
         } // fd with data
+        
         if (handled_responses >= number_of_events)
         {
           break;
         }
-      } // for each fd
+      } // for each client fd
     } // polls any event
   } // while server alive
-#endif
 
   logn("Shutting down server");
+  fclose(log_file);
 
   for (int i = 0; i < server.nfds; ++i)
   {
-    close(server.connections[i].fd);
+    close(server.fds[i].fd);
   }
-
-  close(socketfd);
 
   return 0;
 }
